@@ -1,0 +1,547 @@
+import MetaTrader5 as mt5
+import pandas as pd
+import pandas_ta as ta
+import time
+import requests
+from datetime import datetime, timezone
+
+# --- CONFIGURATION ---
+SYMBOL = "XAUUSD"
+MAGIC_NUMBER = 777
+INITIAL_LOT_SIZE = 0.01
+BE_PROFIT_THRESHOLD = 0.50  # Move to Break-Even when profit hits $0.50
+MAX_SPREAD = 50  # Increased from 30 to 50 (more flexible for XAUUSD)
+TELEGRAM_TOKEN = "8460419191:AAE-oLoDncpXzsPy273QAS-E49caTUOvONY"
+TELEGRAM_CHAT_ID = "7838032408"
+
+# --- DYNAMIC LOT SIZE SETTINGS ---
+RISK_PERCENT = 2.0  # Risk 2% of current balance per trade
+MIN_LOT = 0.01  # Minimum lot size
+MAX_LOT = 0.10  # Maximum lot size (safety cap for $10 account)
+LOT_STEP = 0.01  # Lot increment step (broker dependent)
+USE_DYNAMIC_LOTS = True  # Set to False to use fixed INITIAL_LOT_SIZE
+
+# --- DAILY PERFORMANCE TRACKING ---
+DAILY_PROFIT_TARGET = 5.0  # Stop trading after $5 profit (increased from $3)
+DAILY_LOSS_LIMIT = 3.0  # Stop trading after $3 loss (increased from $2)
+ENABLE_DAILY_LIMITS = True  # Set to False to trade without limits
+
+# --- NEWS FILTER SETTINGS ---
+# Avoid trading 30 min before and after major news (all times in UTC/GMT)
+NEWS_BLACKOUT_MINUTES = 30  # Minutes before/after news to avoid trading
+HIGH_IMPACT_HOURS_UTC = [
+    (13, 30),  # US Session Open (8:30 AM EST) - NFP, CPI, Jobless Claims
+    (15, 0),   # 10:00 AM EST - Consumer Sentiment
+]  # Reduced list for more trading opportunities
+
+# --- DAILY STATS TRACKING ---
+class DailyStats:
+    def __init__(self):
+        self.start_balance = 0
+        self.start_date = None
+        self.trades_today = 0
+        self.wins_today = 0
+        self.losses_today = 0
+        self.profit_today = 0
+        self.largest_win = 0
+        self.largest_loss = 0
+        self.reset_if_new_day()
+    
+    def reset_if_new_day(self):
+        current_date = datetime.now(timezone.utc).date()
+        if self.start_date != current_date:
+            self.start_date = current_date
+            account_info = mt5.account_info()
+            self.start_balance = account_info.balance if account_info else 0
+            self.trades_today = 0
+            self.wins_today = 0
+            self.losses_today = 0
+            self.profit_today = 0
+            self.largest_win = 0
+            self.largest_loss = 0
+            print(f"📅 New day started | Starting balance: ${self.start_balance:.2f}")
+    
+    def update_from_history(self):
+        """Update stats from closed trades today"""
+        self.reset_if_new_day()
+        
+        # Get today's deals
+        today_start = datetime.now(timezone.utc).replace(hour=0, minute=0, second=0)
+        deals = mt5.history_deals_get(today_start, datetime.now(timezone.utc))
+        
+        if deals:
+            for deal in deals:
+                if deal.magic == MAGIC_NUMBER and deal.entry == mt5.DEAL_ENTRY_OUT:
+                    profit = deal.profit
+                    self.profit_today += profit
+                    self.trades_today += 1
+                    
+                    if profit > 0:
+                        self.wins_today += 1
+                        self.largest_win = max(self.largest_win, profit)
+                    else:
+                        self.losses_today += 1
+                        self.largest_loss = min(self.largest_loss, profit)
+    
+    def get_daily_report(self):
+        current_balance = mt5.account_info().balance
+        balance_change = current_balance - self.start_balance
+        win_rate = (self.wins_today / self.trades_today * 100) if self.trades_today > 0 else 0
+        
+        report = (
+            f"📊 DAILY PERFORMANCE REPORT\n"
+            f"{'='*30}\n"
+            f"Date: {self.start_date}\n"
+            f"Start Balance: ${self.start_balance:.2f}\n"
+            f"Current Balance: ${current_balance:.2f}\n"
+            f"Daily P/L: ${balance_change:.2f} ({balance_change/self.start_balance*100:.1f}%)\n"
+            f"{'='*30}\n"
+            f"Trades Today: {self.trades_today}\n"
+            f"Wins: {self.wins_today} | Losses: {self.losses_today}\n"
+            f"Win Rate: {win_rate:.1f}%\n"
+            f"Largest Win: ${self.largest_win:.2f}\n"
+            f"Largest Loss: ${self.largest_loss:.2f}\n"
+            f"{'='*30}\n"
+        )
+        return report
+    
+    def should_stop_trading(self):
+        """Check if daily limits are reached"""
+        if not ENABLE_DAILY_LIMITS:
+            return False, None
+        
+        current_balance = mt5.account_info().balance
+        daily_pl = current_balance - self.start_balance
+        
+        # Only stop if we've made PROFIT from today's starting balance
+        if daily_pl >= DAILY_PROFIT_TARGET:
+            return True, f"✅ Daily profit target reached: +${daily_pl:.2f} from ${self.start_balance:.2f}"
+        
+        # Only stop if we've LOST from today's starting balance
+        if daily_pl <= -DAILY_LOSS_LIMIT:
+            return True, f"🛑 Daily loss limit reached: ${daily_pl:.2f} from ${self.start_balance:.2f}"
+        
+        return False, None
+
+# Initialize this AFTER MT5 connection (will be done in main section)
+daily_stats = None
+
+def send_telegram(msg):
+    try:
+        url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
+        requests.get(url, params={"chat_id": TELEGRAM_CHAT_ID, "text": msg}, timeout=5)
+    except Exception as e:
+        print(f"Telegram error: {e}")
+
+def is_news_time():
+    """Check if current time is within news blackout window"""
+    now_utc = datetime.now(timezone.utc)
+    current_hour = now_utc.hour
+    current_minute = now_utc.minute
+    
+    for news_hour, news_minute in HIGH_IMPACT_HOURS_UTC:
+        # Calculate minutes difference
+        news_time_minutes = news_hour * 60 + news_minute
+        current_time_minutes = current_hour * 60 + current_minute
+        time_diff = abs(current_time_minutes - news_time_minutes)
+        
+        # Check if within blackout window
+        if time_diff <= NEWS_BLACKOUT_MINUTES:
+            return True, f"{news_hour:02d}:{news_minute:02d} UTC"
+    
+    return False, None
+
+def is_low_liquidity_time():
+    """Avoid trading during low liquidity periods"""
+    now_utc = datetime.now(timezone.utc)
+    day_of_week = now_utc.weekday()  # 0=Monday, 6=Sunday
+    
+    # Only avoid Sunday (low liquidity)
+    if day_of_week == 6:
+        return True, "Sunday - low liquidity"
+    
+    return False, None  # Allow trading at all other times
+
+def get_trend_h1():
+    """Determine H1 trend using EMA 200"""
+    try:
+        rates = mt5.copy_rates_from_pos(SYMBOL, mt5.TIMEFRAME_H1, 0, 200)
+        if rates is None or len(rates) < 200:
+            return None
+        df_h1 = pd.DataFrame(rates)
+        ema_200_h1 = ta.ema(df_h1['close'], length=200).iloc[-1]
+        current_price = df_h1['close'].iloc[-1]
+        return "UP" if current_price > ema_200_h1 else "DOWN"
+    except Exception as e:
+        print(f"H1 trend error: {e}")
+        return None
+
+def confirm_trend_strength(df_h1, df_m5):
+    """Analyze market carefully before entry to avoid losses"""
+    try:
+        # 1. Check H1 momentum (last 3 candles)
+        h1_last_3 = df_h1['close'].tail(3)
+        h1_bullish = (h1_last_3.iloc[-1] > h1_last_3.iloc[-2] > h1_last_3.iloc[-3])
+        h1_bearish = (h1_last_3.iloc[-1] < h1_last_3.iloc[-2] < h1_last_3.iloc[-3])
+        
+        # 2. Check M5 momentum (last 5 candles for confirmation)
+        m5_last_5 = df_m5['close'].tail(5)
+        m5_rising = m5_last_5.iloc[-1] > m5_last_5.iloc[-3]  # Price rising over last 3 candles
+        m5_falling = m5_last_5.iloc[-1] < m5_last_5.iloc[-3]  # Price falling
+        
+        # 3. Check if EMAs are properly aligned (strong trend)
+        m5_ema8 = df_m5['ema_8'].iloc[-1]
+        m5_ema21 = df_m5['ema_21'].iloc[-1]
+        ema_gap = abs(m5_ema8 - m5_ema21)
+        
+        # EMAs should have clear separation (not too close = weak trend)
+        min_ema_gap = 2.0  # Minimum distance between EMAs
+        
+        # 4. Check RSI to avoid overbought/oversold (additional filter)
+        rsi = ta.rsi(df_m5['close'], length=14).iloc[-1]
+        
+        return {
+            'h1_strong_bull': h1_bullish,
+            'h1_strong_bear': h1_bearish,
+            'm5_momentum_up': m5_rising,
+            'm5_momentum_down': m5_falling,
+            'ema_gap_ok': ema_gap >= min_ema_gap,
+            'rsi': rsi,
+            'rsi_not_overbought': rsi < 70,  # Not overbought for buys
+            'rsi_not_oversold': rsi > 30,    # Not oversold for sells
+            'ema_gap': ema_gap
+        }
+    except Exception as e:
+        print(f"Trend strength analysis error: {e}")
+        return None
+
+def check_spread():
+    """Ensure spread is acceptable for scalping"""
+    tick = mt5.symbol_info_tick(SYMBOL)
+    if tick is None:
+        return False, 0
+    
+    point = mt5.symbol_info(SYMBOL).point
+    spread = (tick.ask - tick.bid) / point
+    
+    return spread <= MAX_SPREAD, spread
+
+def calculate_lot_size(atr_stop_distance):
+    """Calculate dynamic lot size based on account balance and risk"""
+    if not USE_DYNAMIC_LOTS:
+        return INITIAL_LOT_SIZE
+    
+    try:
+        account_info = mt5.account_info()
+        if account_info is None:
+            return MIN_LOT
+        
+        balance = account_info.balance
+        symbol_info = mt5.symbol_info(SYMBOL)
+        
+        # Calculate risk amount in dollars
+        risk_amount = balance * (RISK_PERCENT / 100)
+        
+        # Get contract size (100 for XAUUSD typically)
+        contract_size = symbol_info.trade_contract_size
+        
+        # Calculate lot size based on ATR stop
+        # risk_amount = lot_size * contract_size * atr_stop_distance
+        lot_size = risk_amount / (contract_size * atr_stop_distance)
+        
+        # Round to lot step
+        lot_size = round(lot_size / LOT_STEP) * LOT_STEP
+        
+        # Apply min/max limits
+        lot_size = max(MIN_LOT, min(lot_size, MAX_LOT))
+        
+        return round(lot_size, 2)
+    
+    except Exception as e:
+        print(f"Lot calculation error: {e}")
+        return MIN_LOT
+
+def manage_open_trades():
+    """Move SL to break-even when profit threshold is reached, or close at profit target"""
+    positions = mt5.positions_get(symbol=SYMBOL, magic=MAGIC_NUMBER)
+    if positions is None:
+        return
+    
+    for pos in positions:
+        # CLOSE POSITION at $0.50 profit (take profit immediately)
+        if pos.profit >= BE_PROFIT_THRESHOLD:
+            close_request = {
+                "action": mt5.TRADE_ACTION_DEAL,
+                "position": pos.ticket,
+                "symbol": SYMBOL,
+                "volume": pos.volume,
+                "type": mt5.ORDER_TYPE_SELL if pos.type == mt5.ORDER_TYPE_BUY else mt5.ORDER_TYPE_BUY,
+                "price": mt5.symbol_info_tick(SYMBOL).bid if pos.type == mt5.ORDER_TYPE_BUY else mt5.symbol_info_tick(SYMBOL).ask,
+                "magic": MAGIC_NUMBER,
+            }
+            result = mt5.order_send(close_request)
+            if result.retcode == mt5.TRADE_RETCODE_DONE:
+                msg = f"✅ POSITION CLOSED at ${pos.profit:.2f} profit!\nTicket: {pos.ticket}\nProfit secured: ${pos.profit:.2f}"
+                send_telegram(msg)
+                print(msg)
+                
+                # Update stats
+                daily_stats.wins_today += 1
+                daily_stats.profit_today += pos.profit
+                daily_stats.largest_win = max(daily_stats.largest_win, pos.profit)
+            else:
+                print(f"Failed to close position: {result.comment}")
+
+def place_order(order_type, sl, tp, reason, lot_size):
+    """Place order with proper error handling"""
+    tick = mt5.symbol_info_tick(SYMBOL)
+    if tick is None:
+        return False
+    
+    price = tick.ask if order_type == mt5.ORDER_TYPE_BUY else tick.bid
+    symbol_info = mt5.symbol_info(SYMBOL)
+    
+    # Round prices to proper digits
+    digits = symbol_info.digits
+    sl = round(sl, digits)
+    tp = round(tp, digits)
+    
+    request = {
+        "action": mt5.TRADE_ACTION_DEAL,
+        "symbol": SYMBOL,
+        "volume": lot_size,
+        "type": order_type,
+        "price": price,
+        "sl": sl,
+        "tp": tp,
+        "magic": MAGIC_NUMBER,
+        "comment": "M5_Scalper",
+        "type_time": mt5.ORDER_TIME_GTC,
+        "type_filling": mt5.ORDER_FILLING_IOC
+    }
+    
+    result = mt5.order_send(request)
+    
+    if result.retcode == mt5.TRADE_RETCODE_DONE:
+        order_name = "BUY" if order_type == mt5.ORDER_TYPE_BUY else "SELL"
+        account_balance = mt5.account_info().balance
+        
+        # Get current spread
+        _, current_spread = check_spread()
+        
+        msg = (f"🔥 {order_name} {SYMBOL}\n"
+               f"{reason}\n"
+               f"Lot: {lot_size} | Balance: ${account_balance:.2f}\n"
+               f"Spread: {current_spread:.1f} pts\n"
+               f"SL: {sl} | TP: {tp}\n"
+               f"Ticket: {result.order}")
+        send_telegram(msg)
+        
+        # Increment trade counter
+        daily_stats.trades_today += 1
+        
+        return True
+    else:
+        print(f"Order failed: {result.comment} (code: {result.retcode})")
+        return False
+
+def scan_for_entries():
+    """Scan for trading opportunities on 5-MINUTE timeframe with CAREFUL analysis"""
+    try:
+        # Check daily limits first
+        should_stop, reason = daily_stats.should_stop_trading()
+        if should_stop:
+            print(f"🛑 {reason} - Trading paused for today")
+            return
+        
+        # Check for news blackout
+        is_news, news_time = is_news_time()
+        if is_news:
+            print(f"⏸️ News blackout active (near {news_time})")
+            return
+        
+        # Check for low liquidity periods
+        is_low_liq, reason = is_low_liquidity_time()
+        if is_low_liq:
+            print(f"⏸️ Low liquidity period: {reason}")
+            return
+        
+        # Get 5-MINUTE (M5) data
+        rates_m5 = mt5.copy_rates_from_pos(SYMBOL, mt5.TIMEFRAME_M5, 0, 200)
+        rates_h1 = mt5.copy_rates_from_pos(SYMBOL, mt5.TIMEFRAME_H1, 0, 200)
+        
+        if rates_m5 is None or len(rates_m5) < 200:
+            print("❌ Failed to get 5-min data")
+            return
+        if rates_h1 is None or len(rates_h1) < 200:
+            print("❌ Failed to get H1 data")
+            return
+        
+        df_m5 = pd.DataFrame(rates_m5)
+        df_h1 = pd.DataFrame(rates_h1)
+        
+        df_m5['ema_8'] = ta.ema(df_m5['close'], length=8)
+        df_m5['ema_21'] = ta.ema(df_m5['close'], length=21)
+        df_m5['atr'] = ta.atr(df_m5['high'], df_m5['low'], df_m5['close'], length=14)
+        
+        # Get H1 trend
+        trend_h1 = get_trend_h1()
+        if trend_h1 is None:
+            print("❌ Failed to get H1 trend")
+            return
+        
+        # CAREFUL MARKET ANALYSIS before entry
+        strength = confirm_trend_strength(df_h1, df_m5)
+        if strength is None:
+            print("❌ Market analysis failed")
+            return
+        
+        # Check spread
+        spread_ok, current_spread = check_spread()
+        
+        last = df_m5.iloc[-1]
+        atr = last['atr']
+        
+        # Check account balance
+        account_info = mt5.account_info()
+        if account_info is None or account_info.balance <= 0:
+            print(f"❌ ERROR: Account balance is ${account_info.balance if account_info else 0:.2f}")
+            return
+        
+        # DEBUG: Print analysis
+        print(f"🔍 Analyzing... | H1: {trend_h1} | EMA8: {last['ema_8']:.2f} | EMA21: {last['ema_21']:.2f} | RSI: {strength['rsi']:.1f} | Spread: {current_spread:.1f}")
+        
+        # Calculate stop distance
+        stop_distance = atr * 2
+        if not spread_ok:
+            stop_distance = stop_distance * 1.3
+        
+        lot_size = calculate_lot_size(stop_distance)
+        
+        # BUY SIGNAL - WITH STRICT CONFIRMATION
+        if (trend_h1 == "UP" and 
+            last['ema_8'] > last['ema_21'] and
+            strength['ema_gap_ok'] and
+            strength['h1_strong_bull'] and
+            strength['m5_momentum_up'] and
+            strength['rsi_not_overbought']):
+            
+            print(f"✅ STRONG BUY CONFIRMED!")
+            print(f"   - H1 trend: Strong Bullish")
+            print(f"   - M5 momentum: Rising")
+            print(f"   - EMA gap: {strength['ema_gap']:.2f} (Good separation)")
+            print(f"   - RSI: {strength['rsi']:.1f} (Not overbought)")
+            
+            sl = last['close'] - stop_distance
+            tp = last['close'] + (atr * 4)
+            place_order(mt5.ORDER_TYPE_BUY, sl, tp, "CONFIRMED BUY | All filters passed", lot_size)
+        
+        # SELL SIGNAL - WITH STRICT CONFIRMATION
+        elif (trend_h1 == "DOWN" and 
+              last['ema_8'] < last['ema_21'] and
+              strength['ema_gap_ok'] and
+              strength['h1_strong_bear'] and
+              strength['m5_momentum_down'] and
+              strength['rsi_not_oversold']):
+            
+            print(f"✅ STRONG SELL CONFIRMED!")
+            print(f"   - H1 trend: Strong Bearish")
+            print(f"   - M5 momentum: Falling")
+            print(f"   - EMA gap: {strength['ema_gap']:.2f} (Good separation)")
+            print(f"   - RSI: {strength['rsi']:.1f} (Not oversold)")
+            
+            sl = last['close'] + stop_distance
+            tp = last['close'] - (atr * 4)
+            place_order(mt5.ORDER_TYPE_SELL, sl, tp, "CONFIRMED SELL | All filters passed", lot_size)
+        
+        else:
+            # Detailed rejection reasons
+            if trend_h1 == "UP" and last['ema_8'] > last['ema_21']:
+                if not strength['ema_gap_ok']:
+                    print(f"⚠️ Signal rejected: EMA gap too small ({strength['ema_gap']:.2f} < 2.0) - Weak trend")
+                elif not strength['h1_strong_bull']:
+                    print(f"⚠️ Signal rejected: H1 not showing strong bullish momentum")
+                elif not strength['m5_momentum_up']:
+                    print(f"⚠️ Signal rejected: M5 momentum not rising")
+                elif not strength['rsi_not_overbought']:
+                    print(f"⚠️ Signal rejected: RSI overbought ({strength['rsi']:.1f} > 70)")
+            elif trend_h1 == "DOWN" and last['ema_8'] < last['ema_21']:
+                if not strength['ema_gap_ok']:
+                    print(f"⚠️ Signal rejected: EMA gap too small ({strength['ema_gap']:.2f} < 2.0) - Weak trend")
+                elif not strength['h1_strong_bear']:
+                    print(f"⚠️ Signal rejected: H1 not showing strong bearish momentum")
+                elif not strength['m5_momentum_down']:
+                    print(f"⚠️ Signal rejected: M5 momentum not falling")
+                elif not strength['rsi_not_oversold']:
+                    print(f"⚠️ Signal rejected: RSI oversold ({strength['rsi']:.1f} < 30)")
+            else:
+                print(f"⏳ No clear trend alignment yet")
+    
+    except Exception as e:
+        print(f"Entry scan error: {e}")
+
+# --- MAIN ENGINE ---
+if not mt5.initialize():
+    print("MT5 initialization failed")
+    quit()
+
+# Verify symbol exists
+if mt5.symbol_info(SYMBOL) is None:
+    print(f"{SYMBOL} not found")
+    mt5.shutdown()
+    quit()
+
+# Enable symbol if not visible
+if not mt5.symbol_info(SYMBOL).visible:
+    mt5.symbol_select(SYMBOL, True)
+
+# Initialize daily stats AFTER MT5 is connected
+daily_stats = DailyStats()
+print(f"📊 Daily stats initialized | Start balance: ${daily_stats.start_balance:.2f}")
+
+send_telegram(f"🚀 XAUUSD Scalper Bot ONLINE\n💰 Account: ${mt5.account_info().balance:.2f}\nInitial Lot: {INITIAL_LOT_SIZE}\nDynamic Lots: {'ON' if USE_DYNAMIC_LOTS else 'OFF'}\nRisk: {RISK_PERCENT}% per trade\nDaily Limits: {'ON' if ENABLE_DAILY_LIMITS else 'OFF'}")
+
+print(f"Bot started at {datetime.now()}")
+print(f"Symbol: {SYMBOL} | Initial Lot: {INITIAL_LOT_SIZE} | Magic: {MAGIC_NUMBER}")
+print(f"Dynamic Lots: {'ENABLED' if USE_DYNAMIC_LOTS else 'DISABLED'} | Risk: {RISK_PERCENT}%")
+print(f"Max Spread: {MAX_SPREAD} pts | Daily Limits: {'ENABLED' if ENABLE_DAILY_LIMITS else 'DISABLED'}")
+
+# Track report intervals
+last_report_time = time.time()
+REPORT_INTERVAL = 3600  # Send report every hour
+
+# Main loop
+while True:
+    try:
+        # 1. Update daily stats from history
+        daily_stats.update_from_history()
+        
+        # 2. Manage existing positions (break-even logic)
+        manage_open_trades()
+        
+        # 3. Scan for new entries (only if no open positions)
+        if mt5.positions_total() == 0:
+            scan_for_entries()
+        
+        # 4. Send hourly performance report
+        if time.time() - last_report_time >= REPORT_INTERVAL:
+            report = daily_stats.get_daily_report()
+            print(report)
+            send_telegram(report)
+            last_report_time = time.time()
+        
+        # 5. Sleep for 15 seconds before next scan
+        time.sleep(15)
+        
+    except KeyboardInterrupt:
+        print("\nBot stopped by user")
+        final_report = daily_stats.get_daily_report()
+        print(final_report)
+        send_telegram("🛑 Bot stopped manually\n\n" + final_report)
+        break
+    except Exception as e:
+        print(f"Main loop error: {e}")  
+        time.sleep(30)  # Wait longer on errors
+
+mt5.shutdown()
+print("Bot shutdown complete") 
