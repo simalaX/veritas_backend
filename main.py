@@ -9,6 +9,7 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.middleware.cors import CORSMiddleware
 from typing import Optional, List
 from contextlib import asynccontextmanager
+import json
 
 import database, schemas
 from config import settings
@@ -17,19 +18,35 @@ print("=" * 60)
 print("🚀 Starting Veritas API...")
 print("=" * 60)
 
-# 1. Initialize Firebase Admin
+# 1. Initialize Firebase Admin with Environment Variable Support
 try:
-    print(f"🔄 Loading Firebase credentials from: {settings.FIREBASE_JSON_PATH}")
+    # Try to get credentials from environment variable first (for Render/production)
+    cred_json = os.environ.get('FIREBASE_CREDENTIALS')
 
-    if not os.path.exists(settings.FIREBASE_JSON_PATH):
-        print(f"❌ ERROR: Firebase JSON file not found at: {settings.FIREBASE_JSON_PATH}")
-        print(f"   Current directory: {os.getcwd()}")
+    if cred_json:
+        print("🔵 Loading Firebase credentials from environment variable")
+        cred_dict = json.loads(cred_json)
+        cred = credentials.Certificate(cred_dict)
+        firebase_admin.initialize_app(cred)
+        print("✅ Firebase initialized successfully from environment variable")
     else:
+        # Fallback to file for local development
+        print(f"🔄 Loading Firebase credentials from file: {settings.FIREBASE_JSON_PATH}")
+
+        if not os.path.exists(settings.FIREBASE_JSON_PATH):
+            print(f"❌ ERROR: Firebase JSON file not found at: {settings.FIREBASE_JSON_PATH}")
+            print(f"   Current directory: {os.getcwd()}")
+            raise FileNotFoundError(f"Firebase credentials not found")
+
         print(f"✅ Firebase JSON file found")
         cred = credentials.Certificate(settings.FIREBASE_JSON_PATH)
         firebase_admin.initialize_app(cred)
-        print("✅ Firebase initialized successfully")
+        print("✅ Firebase initialized successfully from file")
 
+except json.JSONDecodeError as e:
+    print(f"❌ Firebase initialization failed: Invalid JSON in FIREBASE_CREDENTIALS")
+    print(f"   Error: {e}")
+    traceback.print_exc()
 except Exception as e:
     print(f"❌ Firebase initialization failed: {e}")
     traceback.print_exc()
