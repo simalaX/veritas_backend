@@ -5,7 +5,7 @@ from contextlib import asynccontextmanager
 # Get DATABASE_URL from environment (Render will provide this)
 DATABASE_URL = os.getenv(
     "DATABASE_URL",
-    "postgresql://postgres:Timex88@localhost:5432/veritas_db"  # fallback for local dev
+    "postgresql://veritas_user:ymZQxSKUccBnq7iWz5TBNS2tClfUlhpr@dpg-d5tlokbuibrs73dpgkjg-a/veritas_db_rk5e"  # fallback for local dev
 )
 
 # Render uses 'postgres://' but asyncpg needs 'postgresql://'

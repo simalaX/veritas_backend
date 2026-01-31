@@ -88,7 +88,7 @@ app = FastAPI(title="Veritas Generation API", lifespan=lifespan)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[
-        "https://veritas-frontend.onrender.com",  # Update with your frontend URL
+        "https://veritas-backend-032t.onrender.com",  # Update with your frontend URL
         "http://localhost:5173",
         "http://localhost:3000",
         "*"  # Remove in production
