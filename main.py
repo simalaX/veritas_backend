@@ -14,6 +14,11 @@ import json
 import database, schemas
 from config import settings
 
+# API Key for mobile app authentication
+VALID_API_KEYS = [
+    os.getenv("MOBILE_API_KEY", "veritas-mobile-key-2025"),  # Default key for development
+]
+
 print("=" * 60)
 print("🚀 Starting Veritas API...")
 print("=" * 60)
@@ -101,7 +106,7 @@ print("=" * 60)
 print("✅ Veritas API startup complete!")
 print("=" * 60)
 
-# --- AUTH HELPER ---
+# --- AUTH HELPERS ---
 async def verify_firebase_token(authorization: str = Header(None)):
     if not authorization or not authorization.startswith("Bearer "):
         raise HTTPException(status_code=401, detail="Missing or invalid token")
@@ -113,9 +118,33 @@ async def verify_firebase_token(authorization: str = Header(None)):
     except Exception:
         raise HTTPException(status_code=401, detail="Unauthorized: Invalid Firebase Token")
 
+async def verify_api_key(x_api_key: str = Header(None)):
+    """Verify API key for mobile app authentication"""
+    if not x_api_key:
+        raise HTTPException(
+            status_code=401,
+            detail=json.dumps({
+                "success": False,
+                "message": "Api key is wrong or not found",
+                "data": None
+            })
+        )
+    
+    if x_api_key not in VALID_API_KEYS:
+        raise HTTPException(
+            status_code=401,
+            detail=json.dumps({
+                "success": False,
+                "message": "Api key is wrong or not found",
+                "data": None
+            })
+        )
+    
+    return x_api_key
+
 # --- CONTENT ENDPOINTS ---
 
-# CREATE
+# CREATE - Web Admin Upload (Firebase Auth)
 @app.post("/admin/upload")
 async def upload_content(
     title: str = Form(...),
@@ -149,6 +178,50 @@ async def upload_content(
             "uploaded_at": result['uploaded_at']
         }
     }
+
+# CREATE - Mobile App Upload (API Key Auth)
+@app.post("/mobile/upload")
+async def mobile_upload_content(
+    title: str = Form(...),
+    category: str = Form(...),
+    file: UploadFile = File(...),
+    conn = Depends(database.get_db),
+    api_key: str = Depends(verify_api_key)
+):
+    """Mobile app upload endpoint with API key authentication"""
+    try:
+        ext = os.path.splitext(file.filename)[1]
+        unique_filename = f"{uuid.uuid4()}{ext}"
+        save_path = os.path.join("uploads", unique_filename)
+
+        with open(save_path, "wb") as buffer:
+            shutil.copyfileobj(file.file, buffer)
+
+        # Insert into database
+        query = '''
+            INSERT INTO media_items (title, category, file_path)
+            VALUES ($1, $2, $3)
+            RETURNING id, title, category, file_path, uploaded_at
+        '''
+        result = await conn.fetchrow(query, title, category, unique_filename)
+
+        return {
+            "success": True,
+            "message": "Upload successful",
+            "data": {
+                "id": result['id'],
+                "title": result['title'],
+                "category": result['category'],
+                "file_path": result['file_path'],
+                "uploaded_at": str(result['uploaded_at'])
+            }
+        }
+    except Exception as e:
+        return {
+            "success": False,
+            "message": f"Upload failed: {str(e)}",
+            "data": None
+        }
 
 # READ (Listing with search)
 @app.get("/content", response_model=List[schemas.MediaItemResponse])
