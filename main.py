@@ -19,14 +19,14 @@ print("=" * 60)
 
 # 1. Initialize Firebase Admin
 try:
-    print(f"🔄 Loading Firebase credentials from: {settings.FIREBASE_JSON}")
+    print(f"🔄 Loading Firebase credentials from: {settings.FIREBASE_JSON_PATH}")
 
-    if not os.path.exists(settings.FIREBASE_JSON):
-        print(f"❌ ERROR: Firebase JSON file not found at: {settings.FIREBASE_JSON}")
+    if not os.path.exists(settings.FIREBASE_JSON_PATH):
+        print(f"❌ ERROR: Firebase JSON file not found at: {settings.FIREBASE_JSON_PATH}")
         print(f"   Current directory: {os.getcwd()}")
     else:
         print(f"✅ Firebase JSON file found")
-        cred = credentials.Certificate(settings.FIREBASE_JSON)
+        cred = credentials.Certificate(settings.FIREBASE_JSON_PATH)
         firebase_admin.initialize_app(cred)
         print("✅ Firebase initialized successfully")
 
